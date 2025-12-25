@@ -1,3 +1,6 @@
+ryu-manager ryu.app.simple_switch_13
+
+
 #!/usr/bin/env python
 
 "Node'ların konumlarını ayarlama ve hareket (mobility) modelleri sağlama"
