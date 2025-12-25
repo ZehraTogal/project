@@ -8,7 +8,7 @@ import threading
 import math
 import re
 
-from mininet.node import Node
+from mininet.node import Node, RemoteController
 from mininet.log import setLogLevel, info
 from mn_wifi.cli import CLI
 from mn_wifi.net import Mininet_wifi
@@ -80,9 +80,24 @@ def topology(args):
         max_x=100, max_y=100, seed=20
     )
 
+    # ===========================
+    # ✅✅✅ NEW: RYU CONTROLLER EKLENDİ
+    # ===========================
+    # Ryu terminalde: ryu-manager --ofp-tcp-listen-port 6654 ryu.app.simple_switch_13
+    c0 = net.addController(
+        'c0',
+        controller=RemoteController,
+        ip='127.0.0.1',
+        port=6654
+    )
+    info("✅ RemoteController eklendi: 127.0.0.1:6654\n")
+
     info("*** Ağ başlatılıyor\n")
     net.build()
-    ap1.start([])
+
+    # ✅✅✅ NEW: AP artık RYU'ya bağlı başlıyor
+    ap1.start([c0])
+    info("✅ ap1 Ryu Controller'a bağlandı (tcp:127.0.0.1:6654)\n")
 
     # ---- TxPower değişikliğini thread'den main thread'e taşımak için istek kutusu
     tx_lock = threading.Lock()
