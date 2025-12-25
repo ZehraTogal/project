@@ -1,98 +1,19 @@
-الطريقة الصحيحة (بالترتيب الصحيح)
-1) افتحي ترمنال 1 وشغّلي Ryu ولا تلمسينه
-
-اكتبي:
-
-ryu-manager --ofp-tcp-listen-port 6654 ryu.app.simple_switch_13
-
-
-🔴 مهم جدًا:
-بعد هذا الأمر لا تضغطي Ctrl+C نهائيًا.
-خليه مفتوح وشغال.
-
-لو تبغي تتأكدي إنه فاتح المنفذ:
-
-sudo ss -lntp | grep 6654
+zehra@zehra-VirtualBox:~$ ryu-manager --ofp-tcp-listen-port 6654 ryu.app.simple_switch_13
+loading app ryu.app.simple_switch_13
+loading app ryu.controller.ofp_handler
+instantiating app ryu.app.simple_switch_13 of SimpleSwitch13
+instantiating app ryu.controller.ofp_handler of OFPHandler
 
 
-لازم يطلع سطر LISTEN.
-
-2) افتحي ترمنال 2 وشغّلي السكربت
-
-قبل التشغيل تأكدي إن في سكربتك المنفذ 6654:
-
-c1 = net.addController('c1', controller=RemoteController, ip='127.0.0.1', port=6654)
+-------------------
+zehra@zehra-VirtualBox:~$ sudo ss -lntp | grep 6654
+[sudo] password for zehra: 
+LISTEN    0         50                 0.0.0.0:6654             0.0.0.0:*        users:(("ryu-manager",pid=4415,fd=4))                                          
+zehra@zehra-VirtualBox:~$ 
 
 
-ثم شغّلي:
+----------------
+zehra@zehra-VirtualBox:~$ c1 = net.addController('c1', controller=RemoteController, ip='127.0.0.1', port=6654)
+bash: syntax error near unexpected token `('
+zehra@zehra-VirtualBox:~$ 
 
-sudo python3 mobilityModel.py
-
-3) داخل CLI تأكدي إن ap1 فعلاً متصل بـ Ryu
-
-داخل:
-mininet-wifi>
-
-نفذي هذه الأوامر:
-
-A) شو الكنترولر اللي مربوط:
-ap1 ovs-vsctl get-controller ap1
-
-
-لازم يعطي:
-
-"tcp:127.0.0.1:6654"
-
-B) شو حالة الاتصال (الأهم):
-ap1 ovs-vsctl show
-
-
-دوري على:
-
-Controller "tcp:127.0.0.1:6654"
-
-ويفضل is_connected: true
-
-✅ إذا طلع is_connected: false (حل مباشر)
-
-يعني ap1 ما قدر يتصل بـ Ryu.
-ساعتها نفّذي داخل CLI:
-
-ap1 ovs-vsctl set-controller ap1 tcp:127.0.0.1:6654
-
-
-وبعدها:
-
-ap1 ovs-vsctl show
-
-✅ علامة النجاح من ترمنال Ryu
-
-وأنتي مشغلة Mininet، لازم في ترمنال Ryu يظهر شيء يدل على اتصال سويتش (features / datapath).
-
-إذا ما يطلع أي شيء… هذا يعني واحد من التالي:
-
-Ryu مو شغال (أنتي قتلتيه)
-
-أو ap1 مو متوجه له على 6654
-
-أو في مشكلة OpenFlow13
-
-أهم سطر عندك يثبت إن Ryu كان مغلق
-
-أنتي كتبتي Ryu ثم مباشرة:
-
-^C
-
-
-يعني طبيعي مشروعك اشتغل بس بدون SDN controller.
-
-✅ الآن سوي هذه الخطوة البسيطة جدًا وارسلي لي ناتجها
-
-شغّلي Ryu على 6654 وخليه شغال
-
-شغّلي سكربتك
-
-داخل CLI اكتبي:
-
-ap1 ovs-vsctl get-controller ap1
-ap1 ovs-vsctl show
