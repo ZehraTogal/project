@@ -1,5 +1,4 @@
 #!/usr/bin/env python
-# -*- coding: utf-8 -*-
 
 "Node'ların konumlarını ayarlama ve hareket (mobility) modelleri sağlama"
 
@@ -9,12 +8,25 @@ import threading
 import math
 import re
 
+from mininet.node import Node, RemoteController
 from mininet.log import setLogLevel, info
 from mn_wifi.cli import CLI
 from mn_wifi.net import Mininet_wifi
 
 
+# ✅ Fix: Thread'ler arasında Node.cmd çakışmasını engelle (kütüphane içi thread'ler dahil)
+_GLOBAL_CMD_LOCK = threading.RLock()
+_ORIG_NODE_CMD = Node.cmd
+
+def _locked_node_cmd(self, *args, **kwargs):
+    with _GLOBAL_CMD_LOCK:
+        return _ORIG_NODE_CMD(self, *args, **kwargs)
+
+Node.cmd = _locked_node_cmd
+
+
 def topology(args):
+    "Bir ağ oluşturur."
     net = Mininet_wifi()
 
     info("*** Node'lar oluşturuluyor\n")
@@ -52,19 +64,14 @@ def topology(args):
     sta1.setRange(STA_RANGE)
     sta2.setRange(STA_RANGE)
 
-    # روابط (لتثبيت الاتصال وقياس ping/loss بشكل أوضح)
-    net.addLink(sta1, ap1)
-    net.addLink(sta2, ap1)
-
-    # RSSI واقعي عبر نموذج انتشار
+    # ✅ RSSI'nin gerçekçi olması için Mininet-WiFi propagation modeli seç (opsiyonel ama önerilir)
+    # Bu model RSSI değerlerini otomatik olarak üretir.
     try:
         net.setPropagationModel(model="logDistance", exp=3.0)
         info("📐 PropagationModel: logDistance (exp=3.0)\n")
     except Exception as e:
         info(f"⚠️ setPropagationModel uygulanamadı: {e}\n")
 
-    # ملاحظة: plotGraph + Thread + setTxPower قد يعمل مشاكل
-    # لو بدك رسومات شغل مع -p لتجنب الرسم.
     if '-p' not in args:
         net.plotGraph()
 
@@ -73,34 +80,65 @@ def topology(args):
         max_x=100, max_y=100, seed=20
     )
 
+    # ===========================
+    # ✅✅✅ NEW: RYU CONTROLLER EKLENDİ
+    # ===========================
+    # Ryu terminalde: ryu-manager --ofp-tcp-listen-port 6654 ryu.app.simple_switch_13
+    c0 = net.addController(
+        'c0',
+        controller=RemoteController,
+        ip='127.0.0.1',
+        port=6654
+    )
+    info("✅ RemoteController eklendi: 127.0.0.1:6654\n")
+
     info("*** Ağ başlatılıyor\n")
     net.build()
-    ap1.start([])
 
-    # ✅ أعطي AP IP حتى نقدر نعمل ping لقياس Loss%
-    try:
-        ap1.setIP('10.0.0.1/8', intf=ap1.wintfs[0].name)
-    except Exception:
-        pass
+    # ✅✅✅ NEW: AP artık RYU'ya bağlı başlıyor
+    ap1.start([c0])
+    info("✅ ap1 Ryu Controller'a bağlandı (tcp:127.0.0.1:6654)\n")
 
-    AP_IP = "10.0.0.1"
+    # ---- TxPower değişikliğini thread'den main thread'e taşımak için istek kutusu
+    tx_lock = threading.Lock()
+    tx_request = {"new_power": None}
 
-    # -------------------------
-    # RSSI (حقيقي)
-    # -------------------------
+    # ✅ Thread'ler arasında cmd çakışmasını önleyen lock (AssertionError çözer)
+    cmd_lock = threading.Lock()
+
+    # ✅ Her Station için ayrı lock (opsiyonel ama daha güçlü)
+    sta_cmd_locks = {}
+
+    # ✅✅✅ GERÇEK RSSI OKUMA
     def get_real_rssi(sta):
-        # 1) Mininet-WiFi
+        # 0) İstasyona özel lock hazırla
+        if sta.name not in sta_cmd_locks:
+            sta_cmd_locks[sta.name] = threading.Lock()
+
+        # 1) Mininet-WiFi'nin güncel tuttuğu RSSI değeri
         try:
             r = getattr(sta.wintfs[0], "rssi", None)
+
+            # ✅ Bazı sürümlerde bağlantı yokken 0 döner
+            assoc = getattr(sta.wintfs[0], "associatedTo", None)
+            if (assoc is None) and (r == 0):
+                return None
+
             if r is not None:
                 return int(r)
         except Exception:
             pass
 
-        # 2) iw link
+        # 2) iw çıktısından okumayı dene (arayüz içinde) + lock'lar
         try:
             iface = sta.wintfs[0].name
-            out = sta.cmd(f"iw dev {iface} link 2>/dev/null")
+            with cmd_lock:
+                with sta_cmd_locks[sta.name]:
+                    out = sta.cmd(f"iw dev {iface} link 2>/dev/null")
+
+            if "Not connected" in out or "not connected" in out:
+                return None
+
             m = re.search(r"signal:\s*(-?\d+)\s*dBm", out)
             if m:
                 return int(m.group(1))
@@ -109,149 +147,246 @@ def topology(args):
 
         return None
 
-    # -------------------------
-    # TX power (station) -> mBm
-    # -------------------------
-    def get_tx_mbm(sta):
+    # ✅✅✅ PING LOSS (10 ping) + Parsing + lock'lar
+    def get_ping_loss_percent(src_sta, dst_ip, count=10, timeout=1):
+        """
+        src_sta: istasyon (sta)
+        dst_ip: hedef ip (örn: sta2)
+        % kayıp (loss) değeri döndürür
+        """
         try:
-            iface = sta.wintfs[0].name
-            out = sta.cmd(f"iw dev {iface} info 2>/dev/null")
-            # txpower 23.00 dBm
-            m = re.search(r"txpower\s+([0-9.]+)\s*dBm", out)
-            if m:
-                dbm = float(m.group(1))
-                return int(round(dbm * 100))  # mBm = 100 * dBm
-        except Exception:
-            pass
-        return None
+            if src_sta.name not in sta_cmd_locks:
+                sta_cmd_locks[src_sta.name] = threading.Lock()
 
-    # -------------------------
-    # Loss% via ping parsing
-    # -------------------------
-    def get_loss_percent(sta, dst_ip, count=3, timeout=1):
-        """
-        إذا sta خارج المدى/غير مرتبط => ping يرجع 100% عادة.
-        """
-        try:
-            out = sta.cmd(f"ping -c {count} -W {timeout} {dst_ip} 2>/dev/null")
-            # "3 packets transmitted, 3 received, 0% packet loss"
-            m = re.search(r"(\d+)%\s*packet loss", out)
+            with cmd_lock:
+                with sta_cmd_locks[src_sta.name]:
+                    out = src_sta.cmd(f"ping -c {count} -W {timeout} {dst_ip} 2>/dev/null")
+
+            m = re.search(r"(\d+(?:\.\d+)?)%\s*packet loss", out)
             if m:
                 return float(m.group(1))
         except Exception:
             pass
         return 100.0
 
-    # -------------------------
-    # Safe TxPower change (avoid update_graph thread issues)
-    # -------------------------
-    def safe_set_ap_txpower(ap, new_power_dbm):
+    def mbm_from_dbm(dbm_val):
+        # mBm = dBm * 100
         try:
-            # مؤقتاً عطّل update_graph لتجنب مشاكل الـ thread/plotGraph
-            old_update_graph = getattr(ap, "update_graph", None)
+            return int(float(dbm_val) * 100)
+        except Exception:
+            return None
+
+    def format_rssi(rssi_val):
+        if rssi_val is None:
+            return "N/A"
+        return f"{rssi_val} dBm"
+
+    def status_from_rssi(rssi_val):
+        if rssi_val is None:
+            return "RSSI yok (bağlı değil / menzil dışı)"
+        return "OK"
+
+    def request_txpower_increase(ap, step=5, max_txpower=30):
+        with tx_lock:
+            current = ap.wintfs[0].txpower
+            new_power = current + step
+            if new_power > max_txpower:
+                new_power = max_txpower
+            tx_request["new_power"] = new_power
+
+    def apply_txpower_if_requested(ap):
+        with tx_lock:
+            new_power = tx_request["new_power"]
+            tx_request["new_power"] = None
+
+        if new_power is not None:
+            ap.setTxPower(new_power, intf=ap.wintfs[0].name)
+            info(f"🔧 {ap.name} TxPower güncellendi → {new_power} dBm\n")
+
+    # ✅ TxPower'ı çalışma sırasında periyodik uygula (CLI kapanmasını beklemeden)
+    def txpower_worker(ap, interval=0.5):
+        while True:
             try:
-                ap.update_graph = lambda *a, **k: None
+                apply_txpower_if_requested(ap)
             except Exception:
                 pass
+            time.sleep(interval)
 
-            ap.setTxPower(new_power_dbm, intf=ap.wintfs[0].name)
+    t_tx = threading.Thread(
+        target=txpower_worker,
+        args=(ap1,),
+        daemon=True
+    )
+    t_tx.start()
 
-            if old_update_graph is not None:
-                try:
-                    ap.update_graph = old_update_graph
-                except Exception:
-                    pass
-            return True
-        except Exception as e:
-            info(f"⚠️ TxPower değiştirilemedi: {e}\n")
-            return False
+    def monitor_ap_range_and_rssi(ap, stations, interval=0.5):
+        ap_range = ap.wintfs[0].range
 
-    # -------------------------
-    # Monitor printing in the requested format
-    # -------------------------
-    def monitor_like_output(ap, stations, interval=1.5):
-        RSSI_WARN = -70
-        RSSI_CRIT = -80
-        LOSS_CRIT = 30.0
+        RSSI_CRIT = -70
+        RSSI_WEAK = -80
 
         POWER_STEP = 5
         MAX_TXPOWER = 30
 
+        status = {s.name: None for s in stations}
+        weak_state = {s.name: False for s in stations}
+
         while True:
-            worst_rssi = None
-            worst_loss = 0.0
-
-            info("---------------------------------------------\n")
-
             for s in stations:
-                rssi = get_real_rssi(s)
-                loss = get_loss_percent(s, AP_IP, count=3, timeout=1)
+                dist = s.get_distance_to(ap)
+                inside = (dist <= ap_range)
 
-                if rssi is None:
-                    durum = "RSSI yok (bağlı değil/menzil dışı)"
-                    rssi_str = "N/A"
-                    # لو RSSI غير موجود غالباً Loss=100
-                    loss = 100.0
+                if status[s.name] is None:
+                    status[s.name] = inside
                 else:
-                    if rssi <= RSSI_CRIT:
-                        durum = "COK ZAYIF"
-                    elif rssi <= RSSI_WARN:
-                        durum = "ZAYIF"
-                    else:
-                        durum = "OK"
-                    rssi_str = f"{rssi} dBm"
+                    if inside and not status[s.name]:
+                        info(f"✅ {s.name}, {ap.name} kapsama alanına GİRDİ\n")
+                        status[s.name] = True
+                        weak_state[s.name] = False
+                    elif (not inside) and status[s.name]:
+                        info(f"📴 {s.name}, {ap.name} kapsama alanından ÇIKTI → SİNYAL KOPTU\n")
+                        status[s.name] = False
+                        weak_state[s.name] = False
 
-                tx_mbm = get_tx_mbm(s)
-                tx_part = f" | TX: {tx_mbm} mBm" if tx_mbm is not None else ""
+                if not inside:
+                    continue
 
-                info(f"[IZLEME] {s.name}: RSSI={rssi_str} | Loss={loss:.1f}% | Durum={durum}{tx_part}\n")
+                # ✅ Tahmin değil: GERÇEK RSSI okunuyor
+                rssi_val = get_real_rssi(s)
+                if rssi_val is None:
+                    info(f"❔ {s.name} RSSI okunamadı (mesafe={dist:.2f}m)\n")
+                    continue
 
-                # تحديث worst
-                if rssi is not None:
-                    if (worst_rssi is None) or (rssi < worst_rssi):
-                        worst_rssi = rssi
-                if loss > worst_loss:
-                    worst_loss = loss
+                if rssi_val <= RSSI_CRIT and not weak_state[s.name]:
+                    info(f"⚠️ {s.name} sinyali ZAYIFLADI (GERÇEK RSSI={rssi_val} dBm ≤ {RSSI_CRIT}) → TxPower artırma isteği gönderildi\n")
+                    weak_state[s.name] = True
+                    request_txpower_increase(ap, step=POWER_STEP, max_txpower=MAX_TXPOWER)
 
-            worst_rssi_print = worst_rssi if worst_rssi is not None else "N/A"
-            info(f"[OZET] Worst RSSI: {worst_rssi_print} | Worst Loss: {worst_loss:.1f}\n")
+                if rssi_val > RSSI_CRIT and weak_state[s.name]:
+                    info(f"📶 {s.name} sinyali tekrar İYİ (GERÇEK RSSI={rssi_val} dBm > {RSSI_CRIT})\n")
+                    weak_state[s.name] = False
 
-            # قرار/أكشن
-            action_done = False
-            if worst_rssi is not None and worst_rssi <= RSSI_CRIT:
-                # ارفع TX
-                cur = getattr(ap.wintfs[0], "txpower", 20)
-                newp = min(cur + POWER_STEP, MAX_TXPOWER)
-                if newp != cur:
-                    ok = safe_set_ap_txpower(ap, newp)
-                    if ok:
-                        info(f"-> [AKSIYON] TxPower artırıldı: {cur} -> {newp} dBm\n")
-                        action_done = True
-
-            if (not action_done) and (worst_loss >= LOSS_CRIT):
-                # Loss عالي جداً، جرّب رفع TX أيضاً
-                cur = getattr(ap.wintfs[0], "txpower", 20)
-                newp = min(cur + POWER_STEP, MAX_TXPOWER)
-                if newp != cur:
-                    ok = safe_set_ap_txpower(ap, newp)
-                    if ok:
-                        info(f"-> [AKSIYON] Loss yüksek, TxPower artırıldı: {cur} -> {newp} dBm\n")
-                        action_done = True
-
-            if not action_done:
-                info("-> [AKSIYON] Stabil (değişiklik yok)\n")
+                if rssi_val <= RSSI_WEAK:
+                    info(f"🚨 {s.name} sinyali ÇOK ZAYIF (GERÇEK RSSI={rssi_val} dBm)\n")
 
             time.sleep(interval)
 
-    t = threading.Thread(
+    def rssi_measurement(ap, stations, interval=0.5):
+        while True:
+            for s in stations:
+                dist = s.get_distance_to(ap)
+                rssi_val = get_real_rssi(s)
+                if rssi_val is None:
+                    info(f"📡 {s.name} | mesafe={dist:.2f}m | GERÇEK RSSI=NA\n")
+                else:
+                    info(f"📡 {s.name} | mesafe={dist:.2f}m | GERÇEK RSSI={rssi_val} dBm\n")
+            time.sleep(interval)
+
+    # ✅✅✅ İstenen çıktı formatı (IZLEME / OZET / AKSIYON)
+    def monitor_like_output(ap, stations, interval=2.0):
+        RSSI_CRIT = -70
+        POWER_STEP = 5
+        MAX_TXPOWER = 30
+
+        ip_map = {}
+        for s in stations:
+            if s.name == "sta1":
+                ip_map[s.name] = "10.0.0.3"
+            elif s.name == "sta2":
+                ip_map[s.name] = "10.0.0.2"
+            else:
+                ip_map[s.name] = None
+
+        while True:
+            lines = []
+            rssi_values = []
+            loss_values = []
+
+            try:
+                tx_dbm = ap.wintfs[0].txpower
+            except Exception:
+                tx_dbm = None
+
+            tx_mbm = mbm_from_dbm(tx_dbm) if tx_dbm is not None else None
+
+            for s in stations:
+                rssi_val = get_real_rssi(s)
+
+                dst_ip = ip_map.get(s.name)
+                if dst_ip:
+                    loss = get_ping_loss_percent(s, dst_ip, count=10, timeout=1)
+                else:
+                    loss = 100.0
+
+                durum = status_from_rssi(rssi_val)
+
+                if rssi_val is not None:
+                    rssi_values.append(rssi_val)
+                loss_values.append(loss)
+
+                if tx_mbm is not None and rssi_val is not None:
+                    lines.append(f"[IZLEME] {s.name}: RSSI={format_rssi(rssi_val)} | Loss={loss:.1f}% | Durum={durum} | TX: {tx_mbm} mBm")
+                else:
+                    lines.append(f"[IZLEME] {s.name}: RSSI={format_rssi(rssi_val)} | Loss={loss:.1f}% | Durum={durum}")
+
+            if len(rssi_values) > 0:
+                worst_rssi = min(rssi_values)
+                worst_rssi_str = f"{worst_rssi} dBm"
+            else:
+                worst_rssi = None
+                worst_rssi_str = "N/A"
+
+            worst_loss = max(loss_values) if len(loss_values) > 0 else 100.0
+
+            action = "Stabil (değişiklik yok)"
+            if worst_rssi is not None and worst_rssi <= RSSI_CRIT:
+                action = "TX artırıldı"
+                request_txpower_increase(ap, step=POWER_STEP, max_txpower=MAX_TXPOWER)
+
+            info("---------------------------------------------\n")
+            for ln in lines:
+                info(ln + "\n")
+            info(f"[OZET] Worst RSSI: {worst_rssi_str} | Worst Loss: {worst_loss:.1f}%\n")
+
+            if action == "TX artırıldı":
+                try:
+                    cur = ap.wintfs[0].txpower
+                    newp = cur + POWER_STEP
+                    if newp > MAX_TXPOWER:
+                        newp = MAX_TXPOWER
+                    info(f"-> [AKSIYON] {action}: {mbm_from_dbm(newp)} mBm\n")
+                except Exception:
+                    info(f"-> [AKSIYON] {action}\n")
+            else:
+                info(f"-> [AKSIYON] {action}\n")
+
+            time.sleep(interval)
+
+    t1 = threading.Thread(
+        target=monitor_ap_range_and_rssi,
+        args=(ap1, [sta1, sta2]),
+        daemon=True
+    )
+    t1.start()
+
+    t2 = threading.Thread(
+        target=rssi_measurement,
+        args=(ap1, [sta1, sta2]),
+        daemon=True
+    )
+    t2.start()
+
+    t3 = threading.Thread(
         target=monitor_like_output,
         args=(ap1, [sta1, sta2]),
         daemon=True
     )
-    t.start()
+    t3.start()
 
     info("*** CLI çalıştırılıyor\n")
     CLI(net)
+
+    apply_txpower_if_requested(ap1)
 
     info("*** Ağ durduruluyor\n")
     net.stop()
