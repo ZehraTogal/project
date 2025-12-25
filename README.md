@@ -8,10 +8,11 @@ import threading
 import math
 import re
 
-from mininet.node import Node
+from mininet.node import Node, RemoteController   # ✅ NEW
 from mininet.log import setLogLevel, info
 from mn_wifi.cli import CLI
 from mn_wifi.net import Mininet_wifi
+from mn_wifi.node import OVSKernelAP              # ✅ NEW
 
 
 # ✅ Fix: منع تداخل Node.cmd بين Threads (يشمل Threads المكتبة نفسها)
@@ -27,7 +28,7 @@ Node.cmd = _locked_node_cmd
 
 def topology(args):
     "Bir ağ oluşturur."
-    net = Mininet_wifi()
+    net = Mininet_wifi(accessPoint=OVSKernelAP, controller=RemoteController)  # ✅ NEW
 
     info("*** Node'lar oluşturuluyor\n")
 
@@ -47,14 +48,17 @@ def topology(args):
     if '-m' in args:
         ap1 = net.addAccessPoint(
             'ap1', wlans=2, ssid='ssid1,ssid2', mode='g',
-            channel='1', failMode="standalone",
+            channel='1', failMode="secure",                    # ✅ NEW (was standalone)
+            protocols="OpenFlow13",                            # ✅ NEW
             position='50,50,0',
             range=AP_RANGE
         )
     else:
         ap1 = net.addAccessPoint(
             'ap1', ssid='new-ssid', mode='g', channel='1',
-            failMode="standalone", position='50,50,0',
+            failMode="secure",                                 # ✅ NEW (was standalone)
+            protocols="OpenFlow13",                             # ✅ NEW
+            position='50,50,0',
             range=AP_RANGE
         )
 
@@ -81,8 +85,13 @@ def topology(args):
     )
 
     info("*** Ağ başlatılıyor\n")
+
+    # ✅ NEW: Ryu Controller (simple_switch_13) bağlantısı
+    c1 = net.addController('c1', controller=RemoteController, ip='127.0.0.1', port=6653)  # ✅ NEW
+
     net.build()
-    ap1.start([])
+    c1.start()           # ✅ NEW
+    ap1.start([c1])      # ✅ NEW (was ap1.start([]))
 
     # ---- TxPower değişikliğini thread'den main thread'e taşımak için istek kutusu
     tx_lock = threading.Lock()
