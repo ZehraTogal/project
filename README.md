@@ -1,4 +1,6 @@
 ryu-manager ryu.app.simple_switch_13
+pip3 install ryu
+sudo python3 mobilityModel.py
 
 
 #!/usr/bin/env python
