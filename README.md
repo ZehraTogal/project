@@ -1,206 +1,109 @@
-#!/usr/bin/env python
-
-"Node'ların konumlarını ayarlama ve hareket (mobility) modelleri sağlama"
-
-import sys
-import time
-import threading
-import math
-import re
-
-from mininet.log import setLogLevel, info
-from mn_wifi.cli import CLI
-from mn_wifi.net import Mininet_wifi
-
-
-def topology(args):
-    "Bir ağ oluşturur."
-    net = Mininet_wifi()
-
-    info("*** Node'lar oluşturuluyor\n")
-
-    STA_RANGE = 35
-
-    sta1 = net.addStation(
-        'sta1', mac='00:00:00:00:00:02', ip='10.0.0.2/8',
-        min_x=10, max_x=30, min_y=50, max_y=70, min_v=5, max_v=10
-    )
-    sta2 = net.addStation(
-        'sta2', mac='00:00:00:00:00:03', ip='10.0.0.3/8',
-        min_x=60, max_x=70, min_y=10, max_y=20, min_v=1, max_v=5
-    )
-
-    AP_RANGE = 40
-
-    if '-m' in args:
-        ap1 = net.addAccessPoint(
-            'ap1', wlans=2, ssid='ssid1,ssid2', mode='g',
-            channel='1', failMode="standalone",
-            position='50,50,0',
-            range=AP_RANGE
-        )
-    else:
-        ap1 = net.addAccessPoint(
-            'ap1', ssid='new-ssid', mode='g', channel='1',
-            failMode="standalone", position='50,50,0',
-            range=AP_RANGE
-        )
-
-    info("*** Node'lar yapılandırılıyor\n")
-    net.configureNodes()
-
-    sta1.setRange(STA_RANGE)
-    sta2.setRange(STA_RANGE)
-
-    # ✅ RSSI'nin gerçekçi olması için Mininet-WiFi propagation model seç (opsiyonel ama önerilir)
-    # Bu model RSSI değerlerini kendisi üretir.
-    try:
-        net.setPropagationModel(model="logDistance", exp=3.0)
-        info("📐 PropagationModel: logDistance (exp=3.0)\n")
-    except Exception as e:
-        info(f"⚠️ setPropagationModel uygulanamadı: {e}\n")
-
-    if '-p' not in args:
-        net.plotGraph()
-
-    net.setMobilityModel(
-        time=0, model='RandomDirection',
-        max_x=100, max_y=100, seed=20
-    )
-
-    info("*** Ağ başlatılıyor\n")
-    net.build()
-    ap1.start([])
-
-    # ✅✅✅ GERÇEK RSSI OKUMA
-    def get_real_rssi(sta):
-        # 1) Mininet-WiFi'nin güncel tuttuğu RSSI
-        try:
-            r = getattr(sta.wintfs[0], "rssi", None)
-            if r is not None:
-                return int(r)
-        except Exception:
-            pass
-
-        # 2) iw çıktısından okumayı dene (arayüz içinde)
-        try:
-            iface = sta.wintfs[0].name
-            out = sta.cmd(f"iw dev {iface} link 2>/dev/null")
-            m = re.search(r"signal:\s*(-?\d+)\s*dBm", out)
-            if m:
-                return int(m.group(1))
-        except Exception:
-            pass
-
-        return None
-
-    # ---- TxPower değişikliğini thread'den main thread'e taşımak için istek kutusu
-    tx_lock = threading.Lock()
-    tx_request = {"new_power": None}
-
-    def request_txpower_increase(ap, step=5, max_txpower=30):
-        with tx_lock:
-            current = ap.wintfs[0].txpower
-            new_power = current + step
-            if new_power > max_txpower:
-                new_power = max_txpower
-            tx_request["new_power"] = new_power
-
-    def apply_txpower_if_requested(ap):
-        with tx_lock:
-            new_power = tx_request["new_power"]
-            tx_request["new_power"] = None
-
-        if new_power is not None:
-            ap.setTxPower(new_power, intf=ap.wintfs[0].name)
-            info(f"🔧 {ap.name} TxPower güncellendi → {new_power} dBm\n")
-
-    def monitor_ap_range_and_rssi(ap, stations, interval=0.5):
-        ap_range = ap.wintfs[0].range
-
-        RSSI_CRIT = -70
-        RSSI_WEAK = -80
-
-        POWER_STEP = 5
-        MAX_TXPOWER = 30
-
-        status = {s.name: None for s in stations}
-        weak_state = {s.name: False for s in stations}
-
-        while True:
-            for s in stations:
-                dist = s.get_distance_to(ap)
-                inside = (dist <= ap_range)
-
-                if status[s.name] is None:
-                    status[s.name] = inside
-                else:
-                    if inside and not status[s.name]:
-                        info(f"✅ {s.name}, {ap.name} kapsama alanına GİRDİ\n")
-                        status[s.name] = True
-                        weak_state[s.name] = False
-                    elif (not inside) and status[s.name]:
-                        info(f"📴 {s.name}, {ap.name} kapsama alanından ÇIKTI → SİNYAL KOPTU\n")
-                        status[s.name] = False
-                        weak_state[s.name] = False
-
-                if not inside:
-                    continue
-
-                # ✅ هنا بدل التخمين: نقرأ RSSI الحقيقي
-                rssi_val = get_real_rssi(s)
-                if rssi_val is None:
-                    info(f"❔ {s.name} RSSI okunamadı (mesafe={dist:.2f}m)\n")
-                    continue
-
-                if rssi_val <= RSSI_CRIT and not weak_state[s.name]:
-                    info(f"⚠️ {s.name} sinyali ZAYIFLADI (RSSI(GERÇEK)={rssi_val} dBm ≤ {RSSI_CRIT}) → TxPower artırma isteği gönderildi\n")
-                    weak_state[s.name] = True
-                    request_txpower_increase(ap, step=POWER_STEP, max_txpower=MAX_TXPOWER)
-
-                if rssi_val > RSSI_CRIT and weak_state[s.name]:
-                    info(f"📶 {s.name} sinyali tekrar GÜÇLÜ/İYİ (RSSI(GERÇEK)={rssi_val} dBm > {RSSI_CRIT})\n")
-                    weak_state[s.name] = False
-
-                if rssi_val <= RSSI_WEAK:
-                    info(f"🚨 {s.name} sinyali ÇOK ZAYIF (RSSI(GERÇEK)={rssi_val} dBm)\n")
-
-            time.sleep(interval)
-
-    def rssi_measurement(ap, stations, interval=0.5):
-        while True:
-            for s in stations:
-                dist = s.get_distance_to(ap)
-                rssi_val = get_real_rssi(s)
-                if rssi_val is None:
-                    info(f"📡 {s.name} | mesafe={dist:.2f}m | RSSI(GERÇEK)=NA\n")
-                else:
-                    info(f"📡 {s.name} | mesafe={dist:.2f}m | RSSI(GERÇEK)={rssi_val} dBm\n")
-            time.sleep(interval)
-
-    t1 = threading.Thread(
-        target=monitor_ap_range_and_rssi,
-        args=(ap1, [sta1, sta2]),
-        daemon=True
-    )
-    t1.start()
-
-    t2 = threading.Thread(
-        target=rssi_measurement,
-        args=(ap1, [sta1, sta2]),
-        daemon=True
-    )
-    t2.start()
-
-    info("*** CLI çalıştırılıyor\n")
-    CLI(net)
-
-    apply_txpower_if_requested(ap1)
-
-    info("*** Ağ durduruluyor\n")
-    net.stop()
-
-
-if __name__ == '__main__':
-    setLogLevel('info')
-    topology(sys.argv)
+zehra@zehra-VirtualBox:~$ sudo python3 mobilityModel.py
+[sudo] password for zehra: 
+*** Node'lar oluşturuluyor
+*** Node'lar yapılandırılıyor
+*** ap1-wlan1: minimum tx power (1 dBm) yields 40.00m for requested 40.00m (delta +0.00m)
+*** sta1-wlan0: minimum tx power (1 dBm) yields 116.13m for requested 35.00m (delta +81.13m)
+*** sta2-wlan0: minimum tx power (1 dBm) yields 116.13m for requested 35.00m (delta +81.13m)
+📐 PropagationModel: logDistance (exp=3.0)
+*** Ağ başlatılıyor
+📡 sta1 | mesafe=70.71m | RSSI(GERÇEK)=0 dBm
+📡 sta2 | mesafe=70.71m | RSSI(GERÇEK)=0 dBm
+*** CLI çalıştırılıyor
+*** Starting CLI:
+stopping sta1 
+stopping sta2 
+---------------------------------------------
+[IZLEME] sta1: RSSI=0 dBm | Loss=100.0% | Durum=OK | TX: 100 mBm
+[IZLEME] sta2: RSSI=0 dBm | Loss=100.0% | Durum=OK | TX: 100 mBm
+[OZET] Worst RSSI: 0 dBm | Worst Loss: 100.0%
+-> [AKSIYON] Stabil (değişiklik yok)
+mininet-wifi> ✅ sta1, ap1 kapsama alanına GİRDİ
+⚠️ sta1 sinyali ZAYIFLADI (RSSI(GERÇEK)=-73 dBm ≤ -70) → TxPower artırma isteği gönderildi
+✅ sta2, ap1 kapsama alanına GİRDİ
+⚠️ sta2 sinyali ZAYIFLADI (RSSI(GERÇEK)=-74 dBm ≤ -70) → TxPower artırma isteği gönderildi
+📡 sta1 | mesafe=30.34m | RSSI(GERÇEK)=-73 dBm
+📡 sta2 | mesafe=31.64m | RSSI(GERÇEK)=-74 dBm
+📡 sta1 | mesafe=28.90m | RSSI(GERÇEK)=-72 dBm
+📡 sta2 | mesafe=33.33m | RSSI(GERÇEK)=-74 dBm
+📡 sta1 | mesafe=26.76m | RSSI(GERÇEK)=-71 dBm
+📡 sta2 | mesafe=34.16m | RSSI(GERÇEK)=-75 dBm
+📡 sta1 | mesafe=25.79m | RSSI(GERÇEK)=-71 dBm
+📡 sta2 | mesafe=34.95m | RSSI(GERÇEK)=-75 dBm
+📡 sta1 | mesafe=27.53m | RSSI(GERÇEK)=-71 dBm
+📡 sta2 | mesafe=36.14m | RSSI(GERÇEK)=-75 dBm
+📡 sta1 | mesafe=33.12m | RSSI(GERÇEK)=-74 dBm
+📡 sta2 | mesafe=37.52m | RSSI(GERÇEK)=-76 dBm
+📡 sta1 | mesafe=38.05m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=38.71m | RSSI(GERÇEK)=-76 dBm
+📴 sta2, ap1 kapsama alanından ÇIKTI → SİNYAL KOPTU
+📡 sta1 | mesafe=38.82m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=40.30m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=31.53m | RSSI(GERÇEK)=-73 dBm
+📡 sta2 | mesafe=41.90m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=24.28m | RSSI(GERÇEK)=-70 dBm
+📡 sta2 | mesafe=42.97m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=24.28m | RSSI(GERÇEK)=-70 dBm
+📡 sta2 | mesafe=42.97m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=24.28m | RSSI(GERÇEK)=-70 dBm
+📡 sta2 | mesafe=42.97m | RSSI(GERÇEK)=0 dBm
+📶 sta1 sinyali tekrar GÜÇLÜ/İYİ (RSSI(GERÇEK)=-68 dBm > -70)
+📡 sta1 | mesafe=20.94m | RSSI(GERÇEK)=-68 dBm
+📡 sta2 | mesafe=43.42m | RSSI(GERÇEK)=0 dBm
+⚠️ sta1 sinyali ZAYIFLADI (RSSI(GERÇEK)=-72 dBm ≤ -70) → TxPower artırma isteği gönderildi
+📡 sta1 | mesafe=28.25m | RSSI(GERÇEK)=-72 dBm
+📡 sta2 | mesafe=43.44m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=37.41m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=41.47m | RSSI(GERÇEK)=0 dBm
+Exception in thread wifiParameters:
+Traceback (most recent call last):
+  File "/usr/lib/python3.8/threading.py", line 932, in _bootstrap_inner
+    self.run()
+  File "/usr/lib/python3.8/threading.py", line 870, in run
+    self._target(*self._args, **self._kwargs)
+  File "/usr/local/lib/python3.8/dist-packages/mininet_wifi-2.7-py3.8.egg/mn_wifi/mobility.py", line 175, in parameters
+    self.config_links(mob_nodes)
+  File "/usr/local/lib/python3.8/dist-packages/mininet_wifi-2.7-py3.8.egg/mn_wifi/mobility.py", line 199, in config_links
+    ack = self.check_in_range(intf, ap_intf)
+  File "/usr/local/lib/python3.8/dist-packages/mininet_wifi-2.7-py3.8.egg/mn_wifi/mobility.py", line 143, in check_in_range
+    self.ap_out_of_range(intf, ap_intf)
+  File "/usr/local/lib/python3.8/dist-packages/mininet_wifi-2.7-py3.8.egg/mn_wifi/mobility.py", line 109, in ap_out_of_range
+    intf.disconnect(ap_intf)
+  File "/usr/local/lib/python3.8/dist-packages/mininet_wifi-2.7-py3.8.egg/mn_wifi/link.py", line 533, in disconnect
+    self.iwdev_cmd('{} disconnect'.format(self.name))
+  File "/usr/local/lib/python3.8/dist-packages/mininet_wifi-2.7-py3.8.egg/mn_wifi/link.py", line 117, in iwdev_cmd
+    return self.cmd('iw dev', *args)
+  File "/usr/local/lib/python3.8/dist-packages/mininet/link.py", line 70, in cmd
+    return self.node.cmd( *args, **kwargs )
+  File "/usr/local/lib/python3.8/dist-packages/mininet/node.py", line 386, in cmd
+    self.sendCmd( *args, **kwargs )
+  File "/usr/local/lib/python3.8/dist-packages/mininet/node.py", line 303, in sendCmd
+    assert self.shell and not self.waiting
+AssertionError
+✅ sta2, ap1 kapsama alanına GİRDİ
+📡 sta1 | mesafe=33.17m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=39.33m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=22.48m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=36.99m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=22.48m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=36.99m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=27.40m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=35.05m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=35.79m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=33.13m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=36.71m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=32.61m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=26.42m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=35.67m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=32.20m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=37.80m | RSSI(GERÇEK)=0 dBm
+📴 sta2, ap1 kapsama alanından ÇIKTI → SİNYAL KOPTU
+📡 sta1 | mesafe=35.69m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=40.52m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=38.12m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=43.24m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=38.96m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=42.63m | RSSI(GERÇEK)=0 dBm
+📡 sta1 | mesafe=34.63m | RSSI(GERÇEK)=-76 dBm
+📡 sta2 | mesafe=40.94m | RSSI(GERÇEK)=0 dBm
+✅ sta2, ap1 kapsama alanına GİRDİ
