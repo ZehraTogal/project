@@ -8,9 +8,21 @@ import threading
 import math
 import re
 
+from mininet.node import Node
 from mininet.log import setLogLevel, info
 from mn_wifi.cli import CLI
 from mn_wifi.net import Mininet_wifi
+
+
+# ✅ Fix: منع تداخل Node.cmd بين Threads (يشمل Threads المكتبة نفسها)
+_GLOBAL_CMD_LOCK = threading.RLock()
+_ORIG_NODE_CMD = Node.cmd
+
+def _locked_node_cmd(self, *args, **kwargs):
+    with _GLOBAL_CMD_LOCK:
+        return _ORIG_NODE_CMD(self, *args, **kwargs)
+
+Node.cmd = _locked_node_cmd
 
 
 def topology(args):
